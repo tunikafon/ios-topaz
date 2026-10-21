@@ -8,6 +8,7 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "fdt.h"
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
@@ -271,6 +272,7 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 
 	con_hex2("GOLD", "midr=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
 	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
+	fdt_memory_dump(dtb);
 	con_skip();
 	if (((mmfr0 >> 20) & 0xf) == 0)
 		con_str("GOLD", "no 16K granule here either");
@@ -288,6 +290,10 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
 		delay_ms(1000);
 		con_skip();
+#ifdef MEMINFO_HOLD
+		/* bring-up: keep the diagnostics on screen for a photo */
+		delay_ms(60000);
+#endif
 		con_str("LOADER", loader_boot(dtb));
 	}
 	for (;;)

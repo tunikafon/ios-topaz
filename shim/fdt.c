@@ -3,6 +3,7 @@
  * /chosen (initrd location). Big-endian, 4-byte aligned tokens.
  */
 #include "fdt.h"
+#include "console.h"
 
 #define FDT_MAGIC	0xd00dfeed
 #define FDT_BEGIN_NODE	1
@@ -79,6 +80,67 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 			break;
 		default:	/* FDT_END or garbage */
 			return 0;
+		}
+	}
+}
+
+/*
+ * Print the live DDR banks: the /memory reg (u64 base, u64 size pairs). The
+ * ADT's phys_base/mem_size must describe exactly this RAM, or xnu allocates
+ * from memory that is not there (silent wedges, no panic).
+ */
+int fdt_memory_dump(uintptr_t fdt)
+{
+	if (!fdt || be32(fdt) != FDT_MAGIC)
+		return 0;
+	uintptr_t p = fdt + be32(fdt + 8);
+	uintptr_t strings = fdt + be32(fdt + 12);
+	int depth = 0, in_mem = 0, banks = 0;
+	uint64_t total = 0, top = 0;
+
+	for (;;) {
+		uint32_t tok = be32(p);
+		p += 4;
+		switch (tok) {
+		case FDT_BEGIN_NODE: {
+			const char *name = (const char *)p;
+			depth++;
+			in_mem = depth == 2 && name[0] == 'm' &&
+			    name[1] == 'e' && name[2] == 'm' && name[3] == 'o' &&
+			    name[4] == 'r' && name[5] == 'y' &&
+			    (name[6] == 0 || name[6] == '@');
+			p = align4(skip_str(p));
+			break;
+		}
+		case FDT_END_NODE:
+			in_mem = 0;
+			depth--;
+			break;
+		case FDT_PROP: {
+			uint32_t len = be32(p), nameoff = be32(p + 4);
+			uintptr_t val = p + 8;
+			if (in_mem && streq((const char *)(strings + nameoff), "reg")) {
+				for (uint32_t i = 0; i + 16 <= len; i += 16) {
+					uint64_t base = (uint64_t)be32(val + i) << 32 | be32(val + i + 4);
+					uint64_t size = (uint64_t)be32(val + i + 8) << 32 | be32(val + i + 12);
+					con_hex2("MEM", "bank=", banks, "mib=", (uint32_t)(size >> 20));
+					con_hex2("MEM", "at=", (uint32_t)(base >> 20), "top=",
+					    (uint32_t)((base + size) >> 20));
+					if (base + size > top)
+						top = base + size;
+					total += size;
+					banks++;
+				}
+			}
+			p = align4(val + len);
+			break;
+		}
+		case FDT_NOP:
+			break;
+		default:	/* FDT_END or garbage */
+			con_hex2("MEM", "banks=", banks, "mib=", (uint32_t)(total >> 20));
+			con_hex2("MEM", "top=", (uint32_t)(top >> 20), "gb=", (uint32_t)(total >> 30));
+			return banks;
 		}
 	}
 }

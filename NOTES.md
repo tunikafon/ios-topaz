@@ -2,6 +2,58 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-22 topaz: boots to iOS userland, stalls before the 2nd frame (read this first) <<<
+
+**The phone (user's topaz, 6 GB RAM, serial 678e5241) runs iOS 16.7.16 userland
+end to end: HFS+ root mounts, launchd spawns everything, SpringBoard +
+backboardd run, backboardd presents ONE frame (SwapBegin/SwapEnd with the
+1132-byte record, kIOReturnSuccess) — and then everything idles forever: no
+2nd frame, no home screen. Screen shows the static boot logo.**
+
+Proven by pulling the SWEET console ring (`tools/sweet-log-pull.sh`) from TWRP
+(`fastboot boot` twrp-3.7.1_12-0-topaz-TeamWin.img, RAM only): log at
+`work/logs/boot-mid-1cpu-con.txt` (kernel 0139 artifact from the user's fork
+CI, cmdline cpus=1 + console + sweetsample=SpringBoard,backboardd,launchd).
+
+Findings from that log:
+
+1. **The 6 GB topaz has DDR banks 0x40000000-0x7CC00000, 0x80000000-0xC0000000,
+   0xC0000000-0x1C0000000 (top 0x1C0000000).** The old `--highmem` ADT
+   (0x140000000 + 4 GiB = 0x240000000) described 2.25 GiB of phantom RAM ->
+   silent wedges at random points (xpcproxy/geod/profiled, "hangs" were the
+   console going off-panel). **Fix: `MIDSIZE=0x140000000 mkadt --midmem`**
+   (0x80000000 + 5 GiB, exactly the real banks). With it the boot runs clean.
+   The shim now prints the live banks: `fdt_memory_dump()` in shim/fdt.c
+   (MEMINFO_HOLD=1 in shim/build.sh holds the screen 60 s for a photo).
+2. The "IOAcceleratorES matching" spam in backboardd is normal (the empty
+   service of patch 0138; the GL renderer polls it).
+3. fairplayd.H2 + bluetoothd crash-loop ~every 30 s (documented, no hardware).
+4. 49 `SMP` user-stack samples: **every thread of SpringBoard/backboardd/launchd
+   sits in a wait syscall (mach_msg/psynch) and the states are IDENTICAL 120 s
+   apart** — userland is idle-waiting, not spinning.
+5. backboardd did the FULL display bring-up (sel 57..12, 6, 27, 17, 84, 50,
+   "display on", SwapBegin, SwapEnd, GetLayerDefaultSurface, sel 55,
+   thermalmonitord sel 78) and then made ZERO further IOMFB calls. Its IOMFB
+   thread waits in IOConnectCallAsync (the notification port).
+6. **`sel 72` (EnableNotifications) was never called** -> fFunc[VSYNC]==0 ->
+   `notify()` returns without sending -> backboardd never gets a vsync/swapped
+   callback -> never presents frame 2 -> SpringBoard stays in checkIn.
+   Why the client never calls sel 72 on this unit while the author's works is
+   the open question (next: symbolicate the samples — the DSC was extracted
+   from userdata at raw offset ~8.52 GiB, magic `dyld_v1`, slide 0x3af48000).
+7. `present()` skipped all layers of frame 1 (`id == 0` in the swap record or
+   the enable mask clear) — consistent with 6: the frame never reached the
+   panel, the screen keeps showing the ABL splash that looks like a logo.
+
+Diagnostics image recipes (all in shim/out/): `shim-boot-mid-4cpu.img` (fast
+path), `-mid-1cpu.img`, `-mid-4cpu-con.img` / `-mid-1cpu-con.img` (console +
+sampler), `-meminfo.img` (DDR dump, 60 s hold). TWRP pulled log:
+`bash tools/sweet-log-pull.sh out.txt` (TWRP: `fastboot boot twrp-topaz.img`,
+adb recovery shell; the recovery kernel has no hfsplus, only raw dd).
+
+The userdata = iOS root and slot b still boots stock boot_b into a dead
+userdata: every iOS test stays `fastboot boot` for now.
+
 ### >>> UPDATE 2026-10-21 topaz: BOTH FLASH FILES ARE BUILT (read this first) <<<
 
 **STATE: the two files for `fastboot` are ready on this PC (Artix Linux, x86_64),

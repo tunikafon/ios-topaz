@@ -24,3 +24,4 @@ work/*.simg
 work/.stage-*
 work/mnt/
 work/stage/
+work/logs/
