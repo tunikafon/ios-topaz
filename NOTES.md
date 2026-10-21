@@ -2,6 +2,86 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-21 topaz: BOTH FLASH FILES ARE BUILT (read this first) <<<
+
+**STATE: the two files for `fastboot` are ready on this PC (Artix Linux, x86_64),
+nothing has been flashed yet (no phone connected).**
+
+| File | Size | Notes |
+| --- | --- | --- |
+| `/home/tunikafon/Projects/ios-topaz/ios16-root.simg` | 12 149 369 748 B | iOS 16.7.16 (20H392) root for iPhone X, HFS+ 16 GB volume, sparse |
+| `/home/tunikafon/Projects/ios-topaz/shim/out/shim-boot.img` | 17 383 424 B | boot image v4: topaz shim + XNU payload |
+
+```sh
+cd /home/tunikafon/Projects/ios-topaz
+fastboot -S 512M flash userdata ios16-root.simg
+fastboot boot shim/out/shim-boot.img
+```
+
+(phone in fastboot = Power + Volume down, unlocked bootloader; `userdata` is
+erased, `boot`/`vendor_boot`/firmware are not written. `work/flash.sh` does the
+same and saves the GPT heads first - see RECOVERY.md, the iOS UFS driver
+damaged the LUN0 GPT on 2026-10-19.)
+
+**Kernel:** `xnu/out/kernel.development.sweet` from the public CI run
+**39419628786** (commit `2665612a`, patches up to 0130; patches 0131-0139 of the
+repo are NOT in it). The user downloaded `xnu-kernel.zip` (GitHub login needed
+for artifacts). Verified: sha256 `4ef3775214ba0c340caf1c5680357100a4a58e68718ae7c1687af0c1f951338e`
+matches the artifact's SHA256SUMS, Mach-O arm64 PIE, **no** LC_DYLD_CHAINED_FIXUPS
+(a static kernelcache - `fixups: 0` in mkpayload is expected), and **no LSE
+atomics**: `llvm-objdump -d --mattr=+v8.5a ... | grep -P '\t(cas|ldadd|ldset|ldclr|swp|ldapr)'`
+-> 0 hits (the CPU is ARMv8.0).
+
+**Boot image:** `work/build-boot.sh` = `tools/mkadt.py shim/out/topaz.adt --highmem`
+-> `tools/mkpayload.py` (cmdline `debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress
+rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin
+ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30`)
+-> `shim/build.sh out/payload.bin` (the payload path is relative to `shim/`).
+The payload (17 185 008 B) is appended behind the shim Image at the first 4K
+boundary after `_end`; the shim finds it by the `SWEETXNU` magic.
+
+**Root image:** `work/build-root.sh` (staged variant of `tools/mkiosroot.sh`, one
+.dmg at a time, each deleted after the copy). IPSW pieces are fetched with HTTP
+range requests (`work/remotezip.py`, `--http1.1` is twice as fast as HTTP/2
+here; `work/fetch-ipsw.sh` restarts the download after a network drop, the
+.part file continues where it stopped). D22AP "Erase" identity:
+OS `087-86698-044.dmg` (4 730 814 044 B, stored in the zip), SystemOS
+`087-86593-047.dmg` (1 097 727 251 B compressed -> 2 743 074 816 B), AppOS
+`087-86715-047.dmg` (10 485 760 B). The logical sha256 of the finished image is
+`23828ea993b04b98c70012c4f818af3301d0a9ff9fc1e605880b3e58a770b270`; it was
+computed while converting and recomputed from the sparse file (match).
+The SWEET tweaks are in the image (grepped: SetupFinishedAllSteps,
+_PanicOnCrasX, KeyBagKeys, StartRecorderServer, BKNoWatchdogs).
+
+**Local toolchain built for this** (in `~/bin`, sources in `~/src`):
+`apfs-fuse` (sgan81/apfs-fuse + `#include <cstdint>` in ApfsLib/PList.h, clang),
+`mkfs.hfsplus`/`fsck.hfsplus` (Fedora diskdev_cmds-540.1.linux3 + Fedora
+patches), `lzfse`. `tools/bin/mkbootimg.py` = AOSP script (LineageOS 19.1) for
+`--header_version 4`; `MKBOOTIMG` must point to it.
+
+**Three things that cost time - do not repeat them:**
+1. `img2simg` needs the raw image and the sparse image at the same time
+   (~23 GB). `work/raw2simg.py` streams raw->sparse and punches holes into the
+   source behind itself, so the peak is the size of the raw image. Its output
+   is byte-identical to `img2simg`'s.
+2. A leftover `apfs-fuse` mount keeps the .dmg open and its space allocated
+   (4.4 GB were lost this way, the disk hit 100%). `work/mkroot-topaz.sh` now
+   unmounts every FUSE mount as root on exit - `mountpoint -q` as the user
+   fails on a root-owned FUSE mount, so the cleanup must not use it.
+3. The unpacked SystemOS .dmg (2.7 GB) plus its copy does not fit next to the
+   8.7 GB OS root on this disk: the SystemOS image is unpacked into tmpfs
+   (`/dev/shm/ios-topaz`) and the copy is made from there.
+
+**Disk:** ~3.7 GB free on `/` (the pacman cache was emptied to get there; the
+Apple pieces and the built images are ~24 GB in total). The raw image was
+punched empty by the conversion - `simg2img ios16-root.simg work/ios16-root.img`
+brings it back if the root has to be modified.
+
+**Next step (the user):** connect the phone, enter fastboot, run the two
+commands above, then report what is on the screen (the shim draws its console
+into ABL's framebuffer for ~8 s, then XNU takes over; the first boot waits on
+the Apple logo while SpringBoard builds the LaunchServices database).
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **LIVE LOG over USB (0077, boot 0077s): no more recovery round-trips.** Boot an image with `sweetusb=2`, run `tools/sweet-usbnet.sh logs/live-NAME.txt` on the PC: it waits for the phone's CDC-ECM interface, sets 192.168.7.1/24 (sudo) and prints/saves the kernel console the phone streams every 100 ms as UDP to 192.168.7.1:5140 (starts with the last 64 KiB). `ping 192.168.7.2` checks the link. Current image: `shim/out/shim-boot-0077s.img` (kernel 0077, ADT sweet-0069hi, cpus=6, sweetfb_noconsole=1, sweetfb_hz=30, sweetusb=2). The recovery pull (`tools/sweet-log-pull.sh`) is still the way after a panic/hang before USB comes up.

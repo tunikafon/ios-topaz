@@ -8,3 +8,19 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+# topaz local build: the ipsw tool and the Apple disk images it downloads
+ipsw/
+work/ipsw/
+work/stage/
+work/mnt/
+work/gpt-backup/
+# the built root images (tens of GB)
+work/*.img
+work/*.simg
+*.simg
+*.img
+!work/*.py
+# local state of work/build-root.sh (which stages are already done)
+work/.stage-*
+work/mnt/
+work/stage/

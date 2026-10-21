@@ -1,0 +1,32 @@
+#!/bin/bash
+# Build the topaz boot image: ADT -> payload -> shim -> shim-boot.img.
+#
+#   build-boot.sh [KERNEL_DEVELOPMENT_SWEET]
+#
+# Needs xnu/out/kernel.development.sweet (the artifact of the xnu.yml GitHub
+# Actions run) and the device tree in research/ipsw-x/d22ap.adt.
+set -euo pipefail
+
+REPO=/home/tunikafon/Projects/ios-topaz
+cd "$REPO"
+
+KERNEL=${1:-xnu/out/kernel.development.sweet}
+[[ -f $KERNEL ]] || { echo "missing kernel: $KERNEL" >&2; exit 1; }
+[[ -f research/ipsw-x/d22ap.adt ]] || {
+	echo "missing device tree: research/ipsw-x/d22ap.adt" >&2; exit 1; }
+
+export MKBOOTIMG="python3 $REPO/tools/bin/mkbootimg.py"
+
+CMDLINE='debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
+
+echo "=== device tree ==="
+python3 tools/mkadt.py shim/out/topaz.adt --highmem
+
+echo "=== payload ==="
+python3 tools/mkpayload.py "$KERNEL" shim/out/topaz.adt shim/out/payload.bin --cmdline "$CMDLINE"
+
+echo "=== shim ==="
+# build.sh cd's into shim/, so the payload path is relative to shim/
+shim/build.sh out/payload.bin
+
+ls -l shim/out/shim-boot.img shim/out/payload.bin shim/out/topaz.adt
