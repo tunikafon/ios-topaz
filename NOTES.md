@@ -2,6 +2,37 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-23: GPU port to topaz — analysis started <<<
+
+**redwood_adreno.c is an excellent base**: 4125 lines, the bring-up
+documented as 22 numbered steps (clocks → fuses → CX/GMU power → GMU fw →
+SMMU contexts → zap shader via TrustZone → SQE microcode → ringbuffer →
+commands), boot-arg driven (adreno=1..22, adreno_keep=1 keeps it for the
+window server), the firmware from /vendor/firmware of the phone's Android.
+
+**Topaz (SM6225) specifics to substitute:**
+* GPU block: kgsl-3d0 @ **0x05900000**; GMU @ **0x0596a000**; gpu_cc @
+  **0x05990000** (SM7325: 0x0ad00000-region — the gpu_cc register offsets
+  inside DIFFER: take them from the SM6225 downstream gpucc-sm6225 driver).
+* Silicon: **Adreno 619** (chipid qcom,adreno-619.0; SM6225 "Adreno 610"),
+  GMU fw **a619_gmu.bin**, SQE **a630_sqe.fw**, zap **a619_zap.mdt** (all in
+  linux-firmware / the phone's /vendor/firmware).
+* RPMh supplies: GPU CX/GX rails differ from SM7325 names — the topaz port
+  already has sweet_rpmh.c working (the touch L11C vote), extend it with the
+  GPU rails (mx/cx levels from the SM6225 DT regulator table).
+* Apps SMMU: the topaz apps_smmu (@0x0f500000-region) — step 8/9 addresses
+  from the SM6225 DT.
+* GCC gpu branches: GCC_PLL_VOTE/GPU_CBCR offsets differ — from gpucc/gcc
+  SM6225.
+* A619 quirks: freedreno supports a619; the GMU protocol matches a6xx (HFI).
+
+**The honest estimate**: 22 steps to adapt and debug on hardware, each
+needing the CI kernel build (~10 min) + a boot test — a multi-session
+project. Everything needed is published (HackiOS code + the Android topaz
+trees + linux-firmware). START POINT: copy redwood_adreno.c as
+topaz_adreno.c, walk the steps, substituting per this list, testing
+adreno=1..N incrementally (the driver's own step machine is made for it).
+
 ### >>> UPDATE 2026-10-23: HackiOS PUBLISHED their source — the GPU path for topaz <<<
 
 **oosexgang (HackiOS) open-sourced their project on 2026-10-22 06:42** — the day
