@@ -2,6 +2,42 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-23: HackiOS PUBLISHED their source — the GPU path for topaz <<<
+
+**oosexgang (HackiOS) open-sourced their project on 2026-10-22 06:42** — the day
+after the topaz README's "will be published once HackiOS publishes" note:
+
+* https://github.com/oosexgang/hackios-xnu-kernel — xnu-8796.121.2 + their
+  Qualcomm drivers: **`bsd/dev/redwood_adreno.c` (4125 lines — the Adreno
+  kernel driver)**, `iokit/Kernel/RedwoodGPU.cpp` (1295), MiniIOSurface (1814),
+  MiniIOMobileFramebuffer (1648), plus redwood_{ufs,wifi,input,cpufreq,lx}.c —
+  a full Snapdragon-on-XNU driver suite for POCO X5 Pro (redwood, SM7325,
+  **Adreno 642L**);
+* https://github.com/oosexgang/hackios-xnu-userland — **Mesa/freedreno built
+  for their kernel ABI** (`tools/mesa`, `mk-mesa.sh`), GLES-for-CoreAnimation
+  working on the Adreno (`gpu=1`, home-screen photos), a Metal frontend
+  (`docs/air.md`: AIR→NIR→ir3, 321/456 system shaders compiled, 7 drawn on the
+  GPU), **injected libraries** for the iOS frameworks (`userland/src/
+  metal_*.m`, `mkeagl.py` — the EAGL shim generator), Sileo/SSH, ~20 s to the
+  lock screen, 8 CPUs.
+
+**The topaz port scope** (their redwood/SM7325/Adreno-642L → our
+topaz/SM6225/Adreno-610, same a6xx family):
+1. kernel: adapt redwood_adreno.c + RedwoodGPU.cpp to SM6225 — the GPU base
+   (kgsl-3d0), GMU/firmware (A619 vs A642L), gpu_cc clocks, GX GDSC, SMMU
+   context banks — all documented in the Android topaz device trees
+   (Topaz-Development/device_xiaomi_topaz);
+2. userland: their Mesa/freedreno rebuild for A610 (freedreno supports
+   a618-class; the 610 quirks are known upstream), their injected Metal/EAGL
+   libraries adapted to iOS 16.7.16 (theirs targets 16.5);
+3. nothing to invent: the architecture is proven on the same SoC family and
+   published with code.
+
+Local copies: /tmp/opencode/hackios, /tmp/opencode/hackios-ul (tmpfs —
+re-clone or persist if needed). Fastest routes: (a) MakrSas integrating it
+into ios-topaz (his README says he'd port HackiOS's work once published — it
+now IS), or (b) community porting (HackiOS Telegram: oosexgangdevs).
+
 ### >>> UPDATE 2026-10-22 part 3: iOS BOOTS AND RUNS on the user's 6 GB topaz <<<
 
 **The CoreImage fix (returning nil from internalContextWithEAGLContext, patched
