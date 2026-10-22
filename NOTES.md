@@ -2,6 +2,47 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-22 part 2: SpringBoard crash-loop root-caused (CI EAGL NULL) <<<
+
+After the LS database completed (the 1.5 h boot), the NEXT boot went much
+further and hit the real remaining wall: **SpringBoard crash-loops (SIGSEGV,
+pc=0) inside CoreImage's EAGL context init.** Pulled log of that boot:
+`work/logs/boot-mid-4cpu-stayon.txt` (8432 lines, 261 flushes). Facts:
+
+* `exec SpringBoard` × **109**, `exec fairplayd.H2` × 260, `exec bluetoothd`
+  × 259 (the last two are the documented no-hardware loops);
+* `exec com.apple.datamigrator` × 9 (relaunches with SpringBoard);
+* 22 `SMP` samples: every thread idle in waits, states identical across
+  samples — the loop is a crash-relaunch cycle, not progress;
+* 0 swaps — no frame ever reaches the panel (the "logo" is the ABL splash);
+* CRASH record (symbolicated with the cryptex DSC + its .symbols companion —
+  both pulled from `/System/Library/Caches/com.apple.dyld/` in the SystemOS
+  cryptex; the .symbols file there is itself a dyld cache with the 8.7M-entry
+  nlist table, parseable directly):
+
+```
+CRASH SpringBoard sig 11 pc 0x0 far 0x0
+-[UIImage _imageWithStylePresets:tintColor:traitCollection:]
+ -[CUICatalog imageByStylingImage:stylePresetName:styleConfiguration:foregroundColor:scale:]
+ +[CUIShapeEffectStack sharedCIContext]        (dispatch_once)
+ +[CIContext contextWithOptions:]
+ -[CIContext initWithOptions:]
+ +[CIContext(Internal) internalContextWithEAGLContext:options:]
+ CI::GLContext::init()                <- calls a NULL function pointer
+```
+
+So: CoreImage creates an **EAGL (GLES) context** for styled-icon rendering;
+there is no GPU driver in this port -> NULL deref -> crash loop -> SpringBoard
+never finishes, backboardd never gets a 2nd frame. The author's phone passes
+this point, so his local kernel (unpublished, > 0139) must handle it — the
+public CI artifact (0139, built by our fork) does not.
+
+Status: everything else WORKS — build pipeline, root image, kernel boot,
+UFS, launchd, LS database (built once, 1.5 h first boot), backboardd display
+bring-up complete, one frame presented. The remaining blocker is exactly this
+CI/EAGL crash loop. Report package for the author: this section + the two
+logs + the sample symbolication method.
+
 ### >>> UPDATE 2026-10-22 topaz: boots to iOS userland, stalls before the 2nd frame (read this first) <<<
 
 **The phone (user's topaz, 6 GB RAM, serial 678e5241) runs iOS 16.7.16 userland
