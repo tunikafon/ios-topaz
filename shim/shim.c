@@ -186,7 +186,15 @@ static void test_gic(void);
  */
 static void gold_gicr_prepare(void)
 {
-	for (uint32_t aff = 0x101; aff <= 0x103; aff++) {
+	/*
+	 * Wake every redistributor and put its SGIs/PPIs in Group 1: xnu starts
+	 * the APs itself (PSCI CPU_ON) and each AP expects its GICR already
+	 * awake, like the boot CPU. Gold MPIDRs are 0x100-0x103; on a 4K-page
+	 * kernel the four Silver A53 cores (0x0-0x3) join too.
+	 */
+	uint32_t affs[8] = { 0x100, 0x101, 0x102, 0x103, 0x0, 0x1, 0x2, 0x3 };
+	for (uint32_t affi = 0; affi < 8; affi++) {
+		uint32_t aff = affs[affi];
 		uintptr_t r = 0;
 		for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
 			uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);

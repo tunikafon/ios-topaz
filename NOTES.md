@@ -28,6 +28,19 @@ Final working artifact set:
 Boot flow: `fastboot boot shim-boot-final.img` for tests; flashing
 `boot_b` for power-button boots (planned, user approved).
 
+VERDICT on the 8-core/4K experiment (2026-10-22 late): the 4K kernel
+COMPILES (CI green on the user's fork, run 39845349521, patch 0140 in the
+fork's topaz) and JUMPS (the shim hand-off completes), but dies immediately
+after — no console output at all. The early boot path (physmap sizing,
+TTBR setup, pmap init) has 16K-tuned constants beyond the commpage assert
+(MACH_VM_MAX nesting, PHYSMAP sizing in pmap.c, likely the kernel VA map
+in ARM64.h). Needs real porting work — on the author's roadmap. Rollback:
+`fastboot boot` of the 16K 4-core image (RAM-only, the phone untouched).
+
+`boot_a` (active slot) is flashed with the known-good shim
+(shim-boot-final.img): iOS boots from the power button. `recovery_a/b` =
+TWRP 3.7.1 topaz. Future kernel revisions: `fastboot boot` only.
+
 ### >>> UPDATE 2026-10-22 part 2: SpringBoard crash-loop root-caused (CI EAGL NULL) <<<
 
 After the LS database completed (the 1.5 h boot), the NEXT boot went much

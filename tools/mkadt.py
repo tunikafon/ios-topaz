@@ -128,20 +128,24 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # TOPAZ SMP: only the four Cortex-A73 (gold) cores, MPIDR 0x100-0x103:
-    # the Kryo 260 Silver cores have no 16K granule, so the shim boots xnu
-    # on gold CPU 0x100 and parks the silver cluster. One cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
+    # TOPAZ SMP: the four Cortex-A73 (gold) cores MPIDR 0x100-0x103, plus the
+    # four Cortex-A53 (silver) cores 0x0-0x3 with SILVER=1 (only for a 4K-page
+    # kernel: the A53s have no 16K granule). One homogeneous SMP group.
+    # The kernel defaults to one and uses cpus=N to select an initial prefix
+    # (N <= 8).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
-    for core in range(1 if qemu else 4):
+    nsilver = int(os.environ.get('SILVER', '0'))
+    for core in range(1 if qemu else 4 + 4 * nsilver):
+        reg = core if qemu else ((0x100 | core) if core < 4 else (core - 4))
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,kryo260') + cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core if qemu else 0x100 | core)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('reg', u32(core if qemu else (0x100 | core if core < 4 else core - 4))),
+            # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
-            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
+            ('cluster-id', u32(0 if core < 4 else 1)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
