@@ -2,6 +2,51 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-23 part 2: GPU port STARTED — patch 0141 TopazAdreno <<<
+
+**Discovered: MakrSas's own `topaz-woa` (Windows on this phone) has a WORKING
+Adreno 610 GPU stack** — `/tmp/opencode/topaz-woa` (cloned, also in
+work/hackios-ref): `drivers/TopazGpuW/hw.c` = the verified bring-up
+(power/zap/SMMU/CP), `docs/P8_gpu.md` = 1199 lines of it with every register.
+The A610 has **no GMU** (a "GMU wrapper"; reading 0x597e340 hangs the bus on
+khaje — do not touch). GPU: kgsl-3d0 0x5900000, gpucc 0x5990000 (CX GDSC
+0x106c/status 0x1540, GX GDSC 0x100c/BCR 0x1008/clamp 0x1508), SMMU 0x59a0000
+(identity CB0: SMR0 0x800=0x80010000, S2CR0 0xc00=0, CBAR 0x1000=0x1f000,
+CBA2R 0x1800=1, SCTLR 0x8000+0=0xe0), zap via TZ PAS id 13
+(mem_setup size MUST be 4K-aligned), SQE a630_sqe.fw minus first dword,
+CP regs in dwords (RB_BASE 0x800, RB_CNTL 0x802=0x0800020c, RPTR 0x806,
+WPTR 0x807, SQE_CNTL 0x808, RBBM_STATUS 0x210, ALWAYS_ON_COUNTER 0x980),
+hw_init = the A612 HWCG table + GBIF_QSB 0x71620 + the exact list in hw.c.
+G1 result on Windows: CP runs, MEM_WRITE 0xC0FFEE00 read-back works.
+
+**Patch 0141 (`0141-topaz-adreno-steps.patch`)**: `iokit/Kernel/arm/
+TopazAdreno.cpp` — the step machine: `adreno=1..5` (1 power, 2 SMMU identity,
+3 zap, 4 CP start, 5 MEM_WRITE test), `adreno_pause`/`adreno_watch`; logs via
+IOLog; called from AppleCLCD::start (like TopazModem). GPU buffer pool at
+**0x7b000000 (2 MB)**: the low DDR bank 0x40000000-0x7cc00000 is NOT
+kernel-managed (midmem ADT: kernel RAM starts 0x80000000) — no VM risk,
+below 4 GB as the A610 needs. Firmware: `/chosen` ADT property "TopazGPUFW"
+(archive: u32 magic 0x67707546 "gpuF", u32 n, {char name[16], u32 off, u32
+size}[], data) built by `tools/mkpayload.py --fw f1 f2 f3`; fallback
+/usr/share/firmware/topaz/gpu/ on the rootfs.
+
+**Next steps**:
+1. CI build of 0141 (fork run after 39868450752; 0140 REMOVED from patches —
+   it breaks boot; keep in history only).
+2. GPU firmware: `tools/pull-gpu-fw.sh` (phone in TWRP; vendor_a from super,
+   EROFS extract on the PC) → a610_zap.mdt/.b02 + a630_sqe.fw (vendor's
+   32504-byte sqe, NOT linux-firmware's).
+3. Boot image: `GPUFW="work/gpu-fw/a610_zap.mdt work/gpu-fw/a610_zap.b02
+   work/gpu-fw/a630_sqe.fw" work/build-boot.sh xnu/out-<run>/kernel...` —
+   NOTE build-boot.sh now builds --midmem MIDSIZE=0x140000000 (was --highmem
+   by mistake — the phantom-RAM wedge config!).
+4. `fastboot boot` with `adreno=1` first (power only — no firmware needed),
+   then adreno=2, then adreno=5 with the fw. Logs: sweetfb console (drop
+   sweetfb_noconsole) or TWRP log pull.
+5. After step 5 passes: keep-on (the redwood RedwoodGPU.cpp model) + the
+   IOKit GPU service, then the userland (HackiOS userland repo: Mesa
+   freedreno for iOS, mkeagl.py).
+
 ### >>> UPDATE 2026-10-23: GPU port to topaz — analysis started <<<
 
 **redwood_adreno.c is an excellent base**: 4125 lines, the bring-up
