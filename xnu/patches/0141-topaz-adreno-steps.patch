@@ -1,14 +1,14 @@
-From e3ab8b6da577c8ec387e9f6121e41943f82de903 Mon Sep 17 00:00:00 2001
+From 95163cb848286eb2ece69a70a0364eab29cccdc6 Mon Sep 17 00:00:00 2001
 From: t <t@t>
-Date: Fri, 23 Oct 2026 01:53:08 +0300
+Date: Fri, 23 Oct 2026 02:04:58 +0300
 Subject: [PATCH] topaz-0141: TopazAdreno: bring the Adreno 610 up step by step
  (adreno=N)
 
 ---
- iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
- iokit/Kernel/arm/TopazAdreno.cpp      | 998 ++++++++++++++++++++++++++
- iokit/conf/files.arm64                |   1 +
- 3 files changed, 1001 insertions(+)
+ iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
+ iokit/Kernel/arm/TopazAdreno.cpp      | 1001 +++++++++++++++++++++++++
+ iokit/conf/files.arm64                |    1 +
+ 3 files changed, 1004 insertions(+)
  create mode 100644 iokit/Kernel/arm/TopazAdreno.cpp
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
@@ -33,10 +33,10 @@ index f469a3a..51f203c 100644
  	fPhys = video.v_baseAddr;
 diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
 new file mode 100644
-index 0000000..c79228f
+index 0000000..81911ed
 --- /dev/null
 +++ b/iokit/Kernel/arm/TopazAdreno.cpp
-@@ -0,0 +1,998 @@
+@@ -0,0 +1,1001 @@
 +/*
 + * topaz (SM6225 khaje, Adreno 610): bring the GPU up step by step. The
 + * sequences are the ones MakrSas/topaz-woa drivers/TopazGpuW/hw.c runs on
@@ -86,11 +86,13 @@ index 0000000..c79228f
 +#include <kern/thread.h>
 +#include <libkern/libkern.h>
 +#include <pexpert/pexpert.h>
++#include <pexpert/pexpert/device_tree.h>
 +#include <sys/vnode.h>
 +#include <sys/fcntl.h>
 +#include <sys/proc.h>
 +
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void topaz_adreno_init(void);        /* SweetFramebuffer.cpp calls this */
 +
 +#define LOG(fmt, ...)       IOLog("TopazAdreno: " fmt "\n", ##__VA_ARGS__)
 +
@@ -480,8 +482,8 @@ index 0000000..c79228f
 +	const void *blob;
 +	unsigned int blob_size;
 +
-+	if (DTLookupEntry(0, "chosen", &entry) != kSuccess ||
-+	    DTGetProperty(entry, "TopazGPUFW", &blob, &blob_size) != kSuccess) {
++	if (SecureDTLookupEntry(NULL, "chosen", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "TopazGPUFW", &blob, &blob_size) != kSuccess) {
 +		return NULL;
 +	}
 +	const uint8_t *p = (const uint8_t *)blob;
@@ -494,21 +496,22 @@ index 0000000..c79228f
 +		return NULL;
 +	}
 +	for (uint32_t i = 0; i < n; i++) {
-+		const struct fw_entry *e = (const struct fw_entry *)(p + 8 + i * sizeof(*e));
++		struct fw_entry e;
 +
-+		if (strncmp(e->name, want, sizeof(e->name)) != 0) {
++		memcpy(&e, p + 8 + i * sizeof(e), sizeof(e));   /* the archive is byte-packed */
++		if (strncmp(e.name, want, sizeof(e.name)) != 0) {
 +			continue;
 +		}
-+		if ((uint64_t)e->off + e->size > blob_size) {
++		if ((uint64_t)e.off + e.size > blob_size) {
 +			return NULL;
 +		}
-+		void *dst = IOMalloc(e->size);
++		void *dst = IOMalloc(e.size);
 +
 +		if (dst == NULL) {
 +			return NULL;
 +		}
-+		memcpy(dst, p + e->off, e->size);
-+		*size_out = e->size;
++		memcpy(dst, p + e.off, e.size);
++		*size_out = e.size;
 +		return dst;
 +	}
 +	return NULL;
@@ -705,7 +708,7 @@ index 0000000..c79228f
 +		goto out;
 +	}
 +	res = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, GPU_PAS_ID, region, ((uint64_t)memsz + 0xfff) & ~0xfffull, NULL);
-+	LOG("  mem_setup: ret=%llx (region %#llx, %u bytes)", res, region, (memsz + 0xfff) & ~0xfffull);
++	LOG("  mem_setup: ret=%llx (region %#llx, %u bytes)", res, region, (uint32_t)((memsz + 0xfff) & ~0xfffull));
 +	if (res != 0) {
 +		goto shutdown;
 +	}
