@@ -2,6 +2,32 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-22 part 3: iOS BOOTS AND RUNS on the user's 6 GB topaz <<<
+
+**The CoreImage fix (returning nil from internalContextWithEAGLContext, patched
+into the DSC inside the flashed userdata) WORKS: iOS boots to the lock screen,
+Settings opens, the user changed dark theme + bold font (settings persisted),
+and ran for hours.** The "self-reboot" after enabling bold text is likely the
+legitimate restart iOS requests for that setting.
+
+Final working artifact set:
+* userdata: `ios16-root.simg` **with the CoreImage DSC patched in place**
+  (partition ~9,207,522,496 on the fresh layout: `CI::GLContext::init`
+  prologue -> `mov x0, xzr ; ret`). NOTE: reflashing the pristine image
+  removes the patch -> reapply before boot (the offset is deterministic on a
+  fresh flash: chunk 25009 file offset 9207872428).
+* boot image: `shim/out/shim-boot-final.img` (cpus=4, noconsole,
+  `sweetfb_stayon=1` — REQUIRED: the panel cannot wake from touch after
+  auto-lock, the screen would go black forever).
+* Known noise: fairplayd.H2 + bluetoothd crash-loop every ~9 s (no hardware);
+  SpringBoard relaunches are gone after the LS database is built.
+* CPU rendering only (laggy) — the GPU renderer awaits HackiOS' published
+  source; `CA::OGL::SW` / `CA_ENABLE_OGL` env knobs are the documented
+  software path (NOTES line ~332).
+
+Boot flow: `fastboot boot shim-boot-final.img` for tests; flashing
+`boot_b` for power-button boots (planned, user approved).
+
 ### >>> UPDATE 2026-10-22 part 2: SpringBoard crash-loop root-caused (CI EAGL NULL) <<<
 
 After the LS database completed (the 1.5 h boot), the NEXT boot went much
