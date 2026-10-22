@@ -132,6 +132,34 @@ def add_ramdisk_to_adt(adt_blob, phys, size):
     return adt.serialize(root)
 
 
+FW_MAGIC = 0x67707546  # "gpuF"
+
+
+def add_fw_to_adt(adt_blob, fw_paths):
+    """Return the ADT with /chosen TopazGPUFW = the GPU firmware archive the
+    kernel driver (TopazAdreno) reads: <u32 magic, u32 n, {char name[16],
+    u32 off, u32 size}...><data>. The ADT is copied to its place by the shim
+    and read from there; no other memory is involved."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    assert chosen.prop('TopazGPUFW') is None, 'ADT already has TopazGPUFW'
+    files = [(os.path.basename(p), open(p, 'rb').read()) for p in fw_paths]
+    entries = b''
+    data = b''
+    for i, (name, blob) in enumerate(files):
+        nb = name.encode()
+        assert len(nb) < 16 and len(nb) > 0, f'bad firmware name {name!r}'
+        assert len(data) < (1 << 31)
+        entries += struct.pack('<16sII', nb + b'\0' * (16 - len(nb)), 8 + 24 * len(files) + len(data), len(blob))
+        data += blob
+        data += b'\0' * (-len(data) % 4)
+    archive = struct.pack('<II', FW_MAGIC, len(files)) + entries + data
+    chosen.props.append(('TopazGPUFW', 0, archive))
+    print(f'ADT /chosen TopazGPUFW: {len(archive)} bytes: ' +
+          ', '.join(f'{n} ({len(b)} B)' for n, b in files))
+    return adt.serialize(root)
+
+
 def adt_dram(adt_blob):
     """Kernel-managed RAM <base, size> from the ADT's /chosen dram-base/dram-size."""
     root, _ = adt.parse(adt_blob)
@@ -140,7 +168,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, fw_paths=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -154,6 +182,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
     adt_blob = open(adt_path, 'rb').read()
+    if fw_paths:
+        adt_blob = add_fw_to_adt(adt_blob, fw_paths)
     # The ADT decides where the kernel's RAM is (mkadt.py --highmem).
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
@@ -198,8 +228,10 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--fw', nargs='+', metavar='FILE',
+                    help='GPU firmware files into the ADT (/chosen TopazGPUFW: a610_zap.mdt a610_zap.b02 a630_sqe.fw)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.fw)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

@@ -20,10 +20,12 @@ export MKBOOTIMG="python3 $REPO/tools/bin/mkbootimg.py"
 CMDLINE='debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
 
 echo "=== device tree ==="
-python3 tools/mkadt.py shim/out/topaz.adt --highmem
+# --midmem (NOT --highmem): highmem left phantom RAM that wedged the phone.
+# MIDSIZE=0x140000000: 0x80000000 + 5 GiB (this phone's 6 GB, top 0x1c0000000).
+MIDSIZE=0x140000000 python3 tools/mkadt.py shim/out/topaz.adt --midmem
 
 echo "=== payload ==="
-python3 tools/mkpayload.py "$KERNEL" shim/out/topaz.adt shim/out/payload.bin --cmdline "$CMDLINE"
+python3 tools/mkpayload.py "$KERNEL" shim/out/topaz.adt shim/out/payload.bin --cmdline "$CMDLINE" ${GPUFW:+--fw $GPUFW}
 
 echo "=== shim ==="
 # build.sh cd's into shim/, so the payload path is relative to shim/
