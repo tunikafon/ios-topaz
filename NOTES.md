@@ -43,6 +43,15 @@ bring-up complete, one frame presented. The remaining blocker is exactly this
 CI/EAGL crash loop. Report package for the author: this section + the two
 logs + the sample symbolication method.
 
+FOLLOW-UP (2026-10-22, boot with `sweetaccel=0` — the empty IOAcceleratorES
+off): log `work/logs/boot-sweetaccel0.txt`. The crash is IDENTICAL
+(slide 0x232c000): UIImage styling -> CUICatalog -> CIContext ->
+internalContextWithEAGLContext: -> CI::GLContext::init()+204 -> NULL. So the
+EAGL path does not depend on the fake accelerator service; the public 0139
+kernel simply lacks whatever the client needs for EAGL init (the author's
+working phone runs a newer local build). Backboardd + IOMFB + one presented
+frame: fine. LS DB: built and persists across boots.
+
 ### >>> UPDATE 2026-10-22 topaz: boots to iOS userland, stalls before the 2nd frame (read this first) <<<
 
 **The phone (user's topaz, 6 GB RAM, serial 678e5241) runs iOS 16.7.16 userland
