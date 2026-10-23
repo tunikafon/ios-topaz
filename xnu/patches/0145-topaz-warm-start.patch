@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 2a0eb11..ced186c 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1299,17 +1299,30 @@ hw_start(void)
+ 	va_space_init();
+ 	g_wedged = false;
+ 
+-	step = 1;
+ 	newest_step = 0;                            /* no holds: this is not a boot-arg step run */
+-	power_cycle_if_on();
+-	if (!step_power()) {
+-		g_hw_failed = true;
+-		return false;
+-	}
+-	step = 3;
+-	if (!step_zap()) {
+-		g_hw_failed = true;
+-		return false;
++	if (rd(g_gpucc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) {
++		/* warm: the core is powered and the CP runs on identity addresses
++		 * (steps 4-5, or a service restart). Collapsing a RUNNING core
++		 * strands NOC transactions -- a CPU write into the pool then
++		 * stalls forever (that was the adreno=6 hang). Stop the CP and
++		 * keep the power; the zap shader stays authenticated. */
++		step = 4;
++		gpu_wr(0x808, 0);                       /* CP_SQE_CNTL: stop */
++		mb();
++		delay_for_interval(10000, NSEC_PER_USEC);
++		LOG("warm start: the CP is stopped, the power stays on");
++	} else {
++		step = 1;
++		power_cycle_if_on();
++		if (!step_power()) {
++			g_hw_failed = true;
++			return false;
++		}
++		step = 3;
++		if (!step_zap()) {
++			g_hw_failed = true;
++			return false;
++		}
+ 	}
+ 	step = 2;
+ 	if (!smmu_stage1()) {
