@@ -1,8 +1,17 @@
 diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
-index c784791..aeac4b8 100644
+index c784791..5ec807f 100644
 --- a/iokit/Kernel/arm/TopazAdreno.cpp
 +++ b/iokit/Kernel/arm/TopazAdreno.cpp
-@@ -841,6 +841,8 @@ static bool
+@@ -837,10 +837,17 @@ ring_idle(uint32_t ms)
+ 	return false;
+ }
+ 
++static uint64_t gk_ib_va;               /* the reserved step-6 IB (hw_reserve) */
++static uint32_t *gk_ib;
++static bool g_reserved;
++static bool hw_reserve(void);
++
+ static bool
  step_cp(void)
  {
  	uint32_t sqe_size = 0, fw_size_v = 0;
@@ -11,7 +20,7 @@ index c784791..aeac4b8 100644
  	uint8_t *fw = (uint8_t *)fw_get(fw_names[2], &sqe_size);
  	uint8_t *sqe;
  	uint64_t sqe_pa = 0;
-@@ -1148,10 +1150,8 @@ static bool
+@@ -1148,10 +1155,8 @@ static bool
  smmu_stage1(void)
  {
  	announce("the SMMU context 0: LPAE tables, translation on");
@@ -23,7 +32,7 @@ index c784791..aeac4b8 100644
  		return false;
  	}
  	LOG("  L1 at %#llx; the bank off next", g_l1_pa);
-@@ -1163,12 +1163,10 @@ smmu_stage1(void)
+@@ -1163,12 +1168,10 @@ smmu_stage1(void)
  	wr(g_smmu, SMMU_CB(0, CB_MAIR0), 0x44);     /* attr 0: Normal non-cacheable */
  	wr(g_smmu, SMMU_CBA2R(0), 1);               /* AArch64 descriptors */
  	wr(g_smmu, SMMU_CBAR(0), 0x0001f000);       /* S1 translate, S2 bypass, VMID 0x1f */
@@ -37,7 +46,7 @@ index c784791..aeac4b8 100644
  	LOG("  TTBR0 %#llx SCTLR %#x TCR %#x", g_l1_pa, rd(g_smmu, SMMU_CB(0, CB_SCTLR)),
  	    rd(g_smmu, SMMU_CB(0, CB_TCR)));
  	return true;
-@@ -1216,27 +1214,11 @@ gk_idle(uint32_t ms)
+@@ -1216,27 +1219,11 @@ gk_idle(uint32_t ms)
  static bool
  cp_start_va(void)
  {
@@ -68,14 +77,10 @@ index c784791..aeac4b8 100644
  	hw_init_regs();
  
  	gpu_wr64(0x830, gk_sqe_va);                 /* CP_SQE_INSTR_BASE */
-@@ -1266,6 +1248,59 @@ cp_start_va(void)
+@@ -1266,6 +1253,55 @@ cp_start_va(void)
  	return gk_idle(100);
  }
  
-+static uint64_t gk_ib_va;
-+static uint32_t *gk_ib;
-+static bool g_reserved;
-+
 +/* Everything a warm restart needs, while pool writes are still safe: the
 + * page tables with the kernel buffers already mapped, the SQE bytes and the
 + * step-6 IB. After the CP has run, a CPU write into the pool stalls the bus
@@ -128,7 +133,7 @@ index c784791..aeac4b8 100644
  /* bring the GPU up from any state: power, the zap shader, the tables, the CP */
  static bool
  hw_start(void)
-@@ -1306,12 +1341,17 @@ hw_start(void)
+@@ -1306,12 +1342,17 @@ hw_start(void)
  	g_wedged = false;
  
  	newest_step = 0;                            /* no holds: this is not a boot-arg step run */
@@ -148,7 +153,7 @@ index c784791..aeac4b8 100644
  		step = 4;
  		gpu_wr(0x808, 0);                       /* CP_SQE_CNTL: stop */
  		mb();
-@@ -1607,15 +1647,8 @@ step_vaspace(void)
+@@ -1607,15 +1648,8 @@ step_vaspace(void)
  	if (!hw_start()) {
  		return false;
  	}
