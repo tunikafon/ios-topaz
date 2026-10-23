@@ -1,16 +1,8 @@
 diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
-index 07189da..64395b5 100644
+index 07189da..f2f08b3 100644
 --- a/iokit/Kernel/arm/TopazAdreno.cpp
 +++ b/iokit/Kernel/arm/TopazAdreno.cpp
-@@ -48,6 +48,7 @@
- #include <libkern/libkern.h>
- #include <pexpert/pexpert.h>
- #include <pexpert/device_tree.h>
-+#include <arm/caches_internal.h>
- #include <sys/vnode.h>
- #include <sys/fcntl.h>
- #include <sys/proc.h>
-@@ -922,11 +923,703 @@ step_memwrite(void)
+@@ -922,11 +922,706 @@ step_memwrite(void)
  	return g_mem[0] == 0xc0ffee00;
  }
  
@@ -41,7 +33,9 @@ index 07189da..64395b5 100644
 +#define PTE_AF              (1ull << 10)
 +#define PTE_PAGE            (PTE_VALID | PTE_TABLE | PTE_AP_UNPRIV | PTE_SH_OUTER | PTE_AF)
 +
-+extern "C" uint32_t gpu_va, gpu_log;    /* boot-args (RedwoodGPU.cpp reads them) */
++extern "C" {
++uint32_t gpu_va, gpu_log;               /* boot-args (RedwoodGPU.cpp reads them) */
++}
 +
 +static uint64_t *g_l1;
 +static uint64_t g_l1_pa;
@@ -81,6 +75,7 @@ index 07189da..64395b5 100644
 +#define CACHE_FLUSH_TS      4
 +
 +extern "C" void redwood_tl(const char * fmt, ...) __printflike(1, 2);
++extern "C" void clean_dcache64(addr64_t addr, unsigned count, int phys);   /* caches_asm.o */
 +
 +void
 +redwood_tl(const char * fmt, ...)
@@ -715,7 +710,7 @@ index 07189da..64395b5 100644
  };
  
  #define NSTEPS (sizeof(steps) / sizeof(steps[0]))
-@@ -1003,6 +1696,8 @@ topaz_adreno_init(void)
+@@ -1003,6 +1698,8 @@ topaz_adreno_init(void)
  		return;
  	}
  	started = true;
