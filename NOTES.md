@@ -31,8 +31,13 @@ size}[], data) built by `tools/mkpayload.py --fw f1 f2 f3`; fallback
 /usr/share/firmware/topaz/gpu/ on the rootfs.
 
 **Next steps**:
-1. CI build of 0141 (fork run after 39868450752; 0140 REMOVED from patches —
-   it breaks boot; keep in history only).
+1. DONE — 0141 compiles: fork CI run 39900968969 GREEN; kernel at
+   xnu/out-0141/kernel.development.sweet (buildtree artifact kept for
+   symbols). Boot image for the first test: shim/out/
+   shim-boot-0141-adreno2.img — cmdline + `adreno=2` (steps 1 power + 2 SMMU
+   identity; NO firmware needed for those). build-boot.sh now takes
+   EXTRA_CMDLINE env; ADT verified dram 0x80000000 + 0x140000000.
+   0140 REMOVED from patches — it breaks boot; keep in history only.
 2. GPU firmware: `tools/pull-gpu-fw.sh` (phone in TWRP; vendor_a from super,
    EROFS extract on the PC) → a610_zap.mdt/.b02 + a630_sqe.fw (vendor's
    32504-byte sqe, NOT linux-firmware's).
