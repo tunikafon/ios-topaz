@@ -20,10 +20,10 @@ index f469a3a..51f203c 100644
  	fPhys = video.v_baseAddr;
 diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
 new file mode 100644
-index 0000000..73f1557
+index 0000000..07189da
 --- /dev/null
 +++ b/iokit/Kernel/arm/TopazAdreno.cpp
-@@ -0,0 +1,1001 @@
+@@ -0,0 +1,1013 @@
 +/*
 + * topaz (SM6225 khaje, Adreno 610): bring the GPU up step by step. The
 + * sequences are the ones MakrSas/topaz-woa drivers/TopazGpuW/hw.c runs on
@@ -645,7 +645,7 @@ index 0000000..73f1557
 +	uint8_t *region_va;
 +	struct elf32_ehdr eh;
 +	struct elf32_phdr ph;
-+	uint32_t i, memsz = 0;
++	uint32_t i, memsz = 0, min_pa = ~0u, max_pa = 0, seg_pa = 0;
 +	bool ok = false, have = false;
 +
 +	if (mdt == NULL || seg == NULL) {
@@ -658,8 +658,11 @@ index 0000000..73f1557
 +		}
 +		return false;
 +	}
-+	if (mdt_size < sizeof(eh) || memcmp(eh.e_ident, mdt, 4) != 0 || mdt_size > 0x4000) {
-+		LOG("  %s: not an ELF32 metadata (%u bytes)", fw_names[0], mdt_size);
++	if (mdt_size < sizeof(eh) || mdt_size > 0x4000 || mdt[0] != 0x7f || mdt[1] != 'E' || mdt[2] != 'L' ||
++	    mdt[3] != 'F' || mdt[4] != 1) {
++		LOG("  %s: not an ELF32 metadata (%u bytes, %02x%02x%02x%02x class %u)", fw_names[0], mdt_size,
++		    mdt_size > 0 ? mdt[0] : 0, mdt_size > 1 ? mdt[1] : 0, mdt_size > 2 ? mdt[2] : 0,
++		    mdt_size > 3 ? mdt[3] : 0, mdt_size > 4 ? mdt[4] : 0);
 +		goto out;
 +	}
 +	memcpy(&eh, mdt, sizeof(eh));
@@ -668,13 +671,22 @@ index 0000000..73f1557
 +		LOG("  %s: unexpected program headers", fw_names[0]);
 +		goto out;
 +	}
++	/* the loadable segments form one address window (min..max p_paddr); TZ
++	 * maps the window and expects the bytes at (p_paddr - min) */
 +	for (i = 0; i < eh.e_phnum; i++) {
 +		memcpy(&ph, mdt + eh.e_phoff + i * sizeof(ph), sizeof(ph));
-+		if (ph.p_type == PT_LOAD && (ph.p_flags & MDT_TYPE_MASK) != MDT_TYPE_HASH) {
-+			memsz = ph.p_memsz;
++		if (ph.p_type == PT_LOAD && (ph.p_flags & MDT_TYPE_MASK) != MDT_TYPE_HASH && ph.p_memsz != 0) {
++			if (ph.p_paddr < min_pa) {
++				min_pa = ph.p_paddr;
++			}
++			if (ph.p_paddr + ph.p_memsz > max_pa) {
++				max_pa = ph.p_paddr + ph.p_memsz;
++			}
++			seg_pa = ph.p_paddr;
 +			have = true;
 +		}
 +	}
++	memsz = have ? max_pa - min_pa : 0;
 +	if (!have || memsz == 0 || memsz > 0x2000) {
 +		LOG("  %s: no loadable segment", fw_names[0]);
 +		goto out;
@@ -700,7 +712,7 @@ index 0000000..73f1557
 +		goto shutdown;
 +	}
 +	bzero(region_va, 0x2000);
-+	memcpy(region_va, seg, seg_size);
++	memcpy(region_va + (seg_pa - min_pa), seg, seg_size);   /* the segment inside the mapped window */
 +	mb();
 +	res = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, GPU_PAS_ID, 0, 0, NULL);
 +	LOG("  auth_and_reset: ret=%llx resumes=%u", res, scm_resumes);
