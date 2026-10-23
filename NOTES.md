@@ -2,6 +2,47 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-23 part 4: **THE ADRENO 610 RUNS** (zap + CP + MEM_WRITE) <<<
+
+Log `work/logs/gpu-adreno5-run3.txt` (pulled through OrangeFox, kernel =
+xnu/out-0142, image `shim/out/shim-boot-gpu5-reset.img`, boot-args
+`adreno=5 sweet_reset=90 sweetfb_noconsole=0`):
+
+```
+step 1: RBBM_STATUS 0x1 CP_HW_FAULT 0, always-on counter ticks (19.2 MHz)      done
+step 2: identity CB0: SMR0 0x80010000 S2CR0 0 CB0 SCTLR 0xe0                      done
+step 3: zap via TZ PAS 13: init_image ret=0, mem_setup ret=0, auth_and_reset
+        ret=0 resumes=1  (the zap shader is authenticated and running)            done
+step 4: SQE (a630_sqe.fw-4B) + hw_init; CP_ME_INIT done, CP_SET_SECURE_MODE
+        done, RBBM_STATUS 0x1                                                     done
+step 5: CP_MEM_WRITE 0xC0FFEE00 -> test buffer c0ffee00 = THE GPU WROTE TO
+        MEMORY                                                                    done
+```
+The A610 executes our packets under XNU. iOS keeps booting afterwards (launchd
+in the same log).
+
+Two 0141 bugs held this back: `memcmp(eh.e_ident, mdt, 4)` compared an
+UNINITIALISED struct (always failed -> "not an ELF32 metadata") and the zap
+segment must sit at `p_paddr - min_paddr` inside the TZ window. Both fixed.
+
+**Hands-off debug loop (patch 0142 `SweetReset.cpp`)** — boot-arg
+`sweet_reset=N`: N s after the framebuffer starts the kernel writes
+IMEM restart_reason 0x77665500 ("bootloader") and issues PSCI SYSTEM_RESET
+(0x84000009) via SMC, the pair the shim has used since the first boot.
+Observed: with `sweet_reset=90` the test image went from the GPU steps, through
+a full iOS boot, and then reset by itself into **OrangeFox with root adb** --
+the PC pulls `work/logs/*` with `tools/sweet-log-pull.sh`, no buttons, no slot
+dance (the phone came up in recovery on its own; misc is all zeros, so this is
+ABL's fallback for slot b, whose boot_b is the stock Android kernel).
+`sweet_reset_reason=` overrides the IMEM value, `sweet_reset_pshold=1` adds the
+PS_HOLD drop if PSCI ever returns.
+
+**Next (GPU)**: keep-on path (the GPU stays powered after the steps) + an IOKit
+service for buffer/ring/fence submission (RedwoodGPU.cpp model), then the
+userland: HackiOS Mesa/freedreno for iOS + EAGL bridge. Before the full stack,
+one honest intermediate proof: submit a real 3D clear/draw from the kernel and
+read the rendered buffer back.
+
 ### >>> UPDATE 2026-10-23 part 3: 0141 never compiled; OrangeFox works on slot b <<<
 
 **The GPU driver was never in the kernel.** `dxb/build.sh` applies each patch
