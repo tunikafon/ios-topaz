@@ -1,0 +1,32 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index ced186c..c784791 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1148,21 +1148,27 @@ static bool
+ smmu_stage1(void)
+ {
+ 	announce("the SMMU context 0: LPAE tables, translation on");
++	LOG("  tables next");
+ 	g_l1 = table_alloc(&g_l1_pa);
+ 	if (g_l1 == NULL) {
+ 		LOG("  no pool page for the L1 table");
+ 		return false;
+ 	}
++	LOG("  L1 at %#llx; the bank off next", g_l1_pa);
+ 	wr(g_smmu, SMMU_CB(0, CB_SCTLR), 0);        /* off while programming */
+ 	wr(g_smmu, SMMU_CB(0, CB_FSR), 0xffffffff); /* clear */
++	LOG("  bank off; TTBR0/TCR/MAIR/CBA2R/CBAR next");
+ 	wr(g_smmu, SMMU_CB(0, CB_TTBR0), (uint32_t)g_l1_pa);
+ 	wr(g_smmu, SMMU_CB(0, CB_TCR), 32 | (1u << 23));    /* T0SZ 32: the A610's 4 GB */
+ 	wr(g_smmu, SMMU_CB(0, CB_MAIR0), 0x44);     /* attr 0: Normal non-cacheable */
+ 	wr(g_smmu, SMMU_CBA2R(0), 1);               /* AArch64 descriptors */
+ 	wr(g_smmu, SMMU_CBAR(0), 0x0001f000);       /* S1 translate, S2 bypass, VMID 0x1f */
++	LOG("  context programmed; translation on next");
+ 	mb();
+ 	wr(g_smmu, SMMU_CB(0, CB_SCTLR), 0x67);     /* M CFIE CFRE AFE TRE */
++	LOG("  translation on; the TLB flush next");
+ 	smmu_tlb_flush();
++	LOG("  TLB flushed");
+ 	LOG("  TTBR0 %#llx SCTLR %#x TCR %#x", g_l1_pa, rd(g_smmu, SMMU_CB(0, CB_SCTLR)),
+ 	    rd(g_smmu, SMMU_CB(0, CB_TCR)));
+ 	return true;
