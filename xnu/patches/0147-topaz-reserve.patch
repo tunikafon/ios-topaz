@@ -1,0 +1,168 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index c784791..aeac4b8 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -841,6 +841,8 @@ static bool
+ step_cp(void)
+ {
+ 	uint32_t sqe_size = 0, fw_size_v = 0;
++
++	hw_reserve();                               /* pool writes are safe before the CP runs */
+ 	uint8_t *fw = (uint8_t *)fw_get(fw_names[2], &sqe_size);
+ 	uint8_t *sqe;
+ 	uint64_t sqe_pa = 0;
+@@ -1148,10 +1150,8 @@ static bool
+ smmu_stage1(void)
+ {
+ 	announce("the SMMU context 0: LPAE tables, translation on");
+-	LOG("  tables next");
+-	g_l1 = table_alloc(&g_l1_pa);
+ 	if (g_l1 == NULL) {
+-		LOG("  no pool page for the L1 table");
++		LOG("  no L1 table (hw_reserve did not run)");
+ 		return false;
+ 	}
+ 	LOG("  L1 at %#llx; the bank off next", g_l1_pa);
+@@ -1163,12 +1163,10 @@ smmu_stage1(void)
+ 	wr(g_smmu, SMMU_CB(0, CB_MAIR0), 0x44);     /* attr 0: Normal non-cacheable */
+ 	wr(g_smmu, SMMU_CBA2R(0), 1);               /* AArch64 descriptors */
+ 	wr(g_smmu, SMMU_CBAR(0), 0x0001f000);       /* S1 translate, S2 bypass, VMID 0x1f */
+-	LOG("  context programmed; translation on next");
++
+ 	mb();
+ 	wr(g_smmu, SMMU_CB(0, CB_SCTLR), 0x67);     /* M CFIE CFRE AFE TRE */
+-	LOG("  translation on; the TLB flush next");
+ 	smmu_tlb_flush();
+-	LOG("  TLB flushed");
+ 	LOG("  TTBR0 %#llx SCTLR %#x TCR %#x", g_l1_pa, rd(g_smmu, SMMU_CB(0, CB_SCTLR)),
+ 	    rd(g_smmu, SMMU_CB(0, CB_TCR)));
+ 	return true;
+@@ -1216,27 +1214,11 @@ gk_idle(uint32_t ms)
+ static bool
+ cp_start_va(void)
+ {
+-	uint32_t sqe_size = 0;
+-	uint8_t *fw = (uint8_t *)fw_get(fw_names[2], &sqe_size);
+-
+-	if (fw == NULL || sqe_size <= 4 || sqe_size > 0x10000) {
+-		LOG("  no SQE firmware (%s, %u bytes)", fw_names[2], sqe_size);
+-		if (fw != NULL) {
+-			IOFree(fw, sqe_size);
+-		}
+-		return false;
+-	}
+-	announce("SQE, the ring and the fence page from the pool, the CP on GPU addresses");
+-	if (!kbuf(sqe_size - 4, &gk_sqe_va, (void **)&gk_sqe) ||
+-	    !kbuf(RB_BYTES, &gk_ring_va, (void **)&gk_ring) ||
+-	    !kbuf(VA_BYTES, &gk_fence_va, (void **)&gk_fence) ||
+-	    !kbuf(VA_BYTES, &gk_test_va, (void **)&gk_test)) {
+-		LOG("  pool: no room for the kept-on buffers");
+-		IOFree(fw, sqe_size);
++	if (!g_reserved) {
++		LOG("  cp_start_va: nothing reserved");
+ 		return false;
+ 	}
+-	memcpy(gk_sqe, fw + 4, sqe_size - 4);       /* the SQE without its first dword */
+-	IOFree(fw, sqe_size);
++	announce("the CP on GPU addresses (reserved ring, SQE, fence)");
+ 	hw_init_regs();
+ 
+ 	gpu_wr64(0x830, gk_sqe_va);                 /* CP_SQE_INSTR_BASE */
+@@ -1266,6 +1248,59 @@ cp_start_va(void)
+ 	return gk_idle(100);
+ }
+ 
++static uint64_t gk_ib_va;
++static uint32_t *gk_ib;
++static bool g_reserved;
++
++/* Everything a warm restart needs, while pool writes are still safe: the
++ * page tables with the kernel buffers already mapped, the SQE bytes and the
++ * step-6 IB. After the CP has run, a CPU write into the pool stalls the bus
++ * (the adreno=6 hang), so none of this may happen after that. */
++static bool
++hw_reserve(void)
++{
++	uint32_t sqe_size = 0;
++	uint8_t *fw;
++
++	if (g_reserved) {
++		return true;
++	}
++	g_l1 = table_alloc(&g_l1_pa);
++	if (g_l1 == NULL) {
++		LOG("  reserve: no pool page for the L1 table");
++		return false;
++	}
++	if (!kbuf(0x8000, &gk_sqe_va, (void **)&gk_sqe) ||
++	    !kbuf(RB_BYTES, &gk_ring_va, (void **)&gk_ring) ||
++	    !kbuf(VA_BYTES, &gk_fence_va, (void **)&gk_fence) ||
++	    !kbuf(VA_BYTES, &gk_test_va, (void **)&gk_test) ||
++	    !kbuf(VA_BYTES, &gk_ib_va, (void **)&gk_ib)) {
++		LOG("  reserve: no room for the kept-on buffers");
++		return false;
++	}
++	fw = (uint8_t *)fw_get(fw_names[2], &sqe_size);
++	if (fw == NULL || sqe_size <= 4 || sqe_size > 0x8000) {
++		LOG("  reserve: no SQE firmware (%s, %u bytes)", fw_names[2], sqe_size);
++		if (fw != NULL) {
++			IOFree(fw, sqe_size);
++		}
++		return false;
++	}
++	memcpy(gk_sqe, fw + 4, sqe_size - 4);       /* the SQE without its first dword */
++	IOFree(fw, sqe_size);
++
++	/* the step-6 IB: a write of 0xC0FFEE01 into the test page */
++	gk_ib[0] = pkt7(CP_MEM_WRITE, 3);
++	gk_ib[1] = (uint32_t)gk_test_va;
++	gk_ib[2] = (uint32_t)(gk_test_va >> 32);
++	gk_ib[3] = 0xc0ffee01;
++	mb();
++	g_reserved = true;
++	LOG("reserve: L1 %#llx, ring %#llx, sqe %#llx, fence %#llx, test %#llx, ib %#llx", g_l1_pa, gk_ring_va,
++	    gk_sqe_va, gk_fence_va, gk_test_va, gk_ib_va);
++	return true;
++}
++
+ /* bring the GPU up from any state: power, the zap shader, the tables, the CP */
+ static bool
+ hw_start(void)
+@@ -1306,12 +1341,17 @@ hw_start(void)
+ 	g_wedged = false;
+ 
+ 	newest_step = 0;                            /* no holds: this is not a boot-arg step run */
++	if (!hw_reserve()) {
++		g_hw_failed = true;
++		return false;
++	}
+ 	if (rd(g_gpucc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) {
+ 		/* warm: the core is powered and the CP runs on identity addresses
+ 		 * (steps 4-5, or a service restart). Collapsing a RUNNING core
+ 		 * strands NOC transactions -- a CPU write into the pool then
+-		 * stalls forever (that was the adreno=6 hang). Stop the CP and
+-		 * keep the power; the zap shader stays authenticated. */
++		 * stalls forever (that was the adreno=6 hang), and so does any
++		 * pool write after the CP stops. From here to the restart:
++		 * registers only; everything else is reserved. */
+ 		step = 4;
+ 		gpu_wr(0x808, 0);                       /* CP_SQE_CNTL: stop */
+ 		mb();
+@@ -1607,15 +1647,8 @@ step_vaspace(void)
+ 	if (!hw_start()) {
+ 		return false;
+ 	}
+-	if (!kbuf(0x100, &ib_va, (void **)&ib_cpu)) {
+-		LOG("  pool: no room for the IB");
+-		return false;
+-	}
+-	ib_cpu[0] = pkt7(CP_MEM_WRITE, 3);
+-	ib_cpu[1] = (uint32_t)gk_test_va;
+-	ib_cpu[2] = (uint32_t)(gk_test_va >> 32);
+-	ib_cpu[3] = 0xc0ffee01;
+-	redwood_gpu_to_memory(ib_cpu, 16);
++	ib_va = gk_ib_va;
++	ib_cpu = gk_ib;                             /* pre-written by hw_reserve */
+ 
+ 	const uint32_t ib_words = 4;
+ 
