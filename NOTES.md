@@ -2,6 +2,56 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-23 part 3: 0141 never compiled; OrangeFox works on slot b <<<
+
+**The GPU driver was never in the kernel.** `dxb/build.sh` applies each patch
+with `git apply --check` and SILENTLY SKIPS the ones that fail ("already
+upstream, previously applied, or malformed"). The committed
+`xnu/patches/0141-topaz-adreno-steps.patch` had become a 2-line fixup only
+(the `#include` line), so the whole `TopazAdreno.cpp` creation + files.arm64
+entry + SweetFramebuffer.cpp hook were missing → every `adreno=N` boot image
+so far ran a kernel with no driver (`strings kernel.development.sweet |
+grep TopazAdreno` = 0; the console log had no lines either). The green CI run
+proved nothing about 0141.
+- FIXED: 0141 regenerated as a full creation patch
+  (`git diff ac0323c HEAD -- iokit/Kernel/arm/SweetFramebuffer.cpp
+  iokit/Kernel/arm/TopazAdreno.cpp iokit/conf/files.arm64`), verified with
+  `git apply --check` on a pristine `ac0323c` tree ("APPLY CHECK OK").
+  Re-run CI 39958987089. VERIFY THE ARTIFACT: `grep -a TopazAdreno
+  kernel.development.sweet` must be non-zero before booting it.
+- LESSON: after every CI run, check the log for "Skipping patch" and check
+  the artifact for the new symbol; a green build can mean "patch skipped".
+
+**Recovery works — but it needs a Linux kernel in the ACTIVE slot's boot.**
+TWRP/OrangeFox images for topaz are RAMDISK-ONLY (`kernel_size` = 0 in the
+boot header: TWRP 3.7.1 tapas 51 MB, OrangeFox R12.0 100 MB). ABL takes the
+kernel from the active slot's `boot` partition, so recovery booted while
+boot_a held stock Android and stopped booting when boot_a became the XNU shim
+(the bootloader then just boots boot_a → XNU). `fastboot boot recovery.img`
+also fails ("Bad Buffer Size"/authenticate) for kernel-less images.
+- PROVEN: `fastboot --set-active=b` (boot_b = stock Android kernel, dumped to
+  `work/stock/boot_b.img.gz`, kernel 15.3 MB) + `fastboot flash recovery_b
+  work/orangefox-topaz.img` + `fastboot reboot recovery` → **OrangeFox R12.0
+  with root adb** (uid=0, `ro.product.device=topaz`).
+- OrangeFox image: official `dl.orangefox.download` release
+  `69f5d0333ba4241a6c1e0965` → zip md5 e189d650..., recovery.img md5
+  d49c858c07... (100 MB). `work/orangefox-topaz.img` is that recovery.img.
+  recovery_a and recovery_b both have OrangeFox now.
+- Back to iOS: `adb reboot bootloader; fastboot --set-active=a; fastboot
+  reboot` (boot_a = shim-boot-final). To use recovery again: switch to b.
+- Log pulled through it: `work/logs/gpu-adreno5.txt` (222 KB, launchd boot
+  with `adreno=5` in boot-args and zero TopazAdreno lines — the proof above).
+
+**GPU firmware obtained without the phone** (vendor_a EROFS not needed):
+`https://raw.githubusercontent.com/Nikita-Projects/proprietary_vendor_xiaomi_topaz/14.0/proprietary/vendor/firmware/`
+→ `work/gpu-fw/a610_zap.mdt` (6860, md5 242d3155...) + `a610_zap.b02` (2096,
+md5 ca88ac01...) + `a630_sqe.fw` (32504, md5 b0f92bf1...). The sqe size
+matches the vendor one from the analysis.
+
+**build-boot.sh**: `NOCONSOLE=0` keeps `sweetfb_noconsole` OFF so the kernel
+log (incl. `TopazAdreno: step N: ...`) shows on the panel — the only way to
+watch the GPU steps without recovery. Default is still console OFF.
+
 ### >>> UPDATE 2026-10-23 part 2: GPU port STARTED — patch 0141 TopazAdreno <<<
 
 **Discovered: MakrSas's own `topaz-woa` (Windows on this phone) has a WORKING
