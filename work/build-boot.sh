@@ -17,7 +17,7 @@ KERNEL=${1:-xnu/out/kernel.development.sweet}
 
 export MKBOOTIMG="python3 $REPO/tools/bin/mkbootimg.py"
 
-CMDLINE='debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30'
+CMDLINE='debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_stayon=1 sweetfb_hz=30'
 # NOCONSOLE=0 shows the kernel log on the panel (GPU bring-up: watch the steps).
 [ "${NOCONSOLE:-1}" = 0 ] || CMDLINE="$CMDLINE sweetfb_noconsole=1"
 # GPU bring-up boots: EXTRA_CMDLINE="adreno=2" (or =5 with GPUFW set) work/build-boot.sh KERNEL
