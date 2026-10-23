@@ -1,0 +1,725 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 07189da..a744dfc 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -48,6 +48,7 @@
+ #include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <arm/caches_internal.h>
+ #include <sys/vnode.h>
+ #include <sys/fcntl.h>
+ #include <sys/proc.h>
+@@ -922,11 +923,702 @@ step_memwrite(void)
+ 	return g_mem[0] == 0xc0ffee00;
+ }
+ 
++/* =======================================================================
++ * 0143: the kept-on GPU. A GPU address space of its own (SMMU stage-1 page
++ * tables), indirect buffers, fences -- the layer a user client submits
++ * through. The exported names are redwood_gpu_* so that HackiOS's
++ * RedwoodGPU.cpp (work/hackios-ref) links without edits; the hardware half
++ * is ours, because the A610 has no GMU: the bring-up above, and the
++ * sequences of the TopazGpuW driver (research/topaz-woa-TopazGpuW) that
++ * runs this very phone under Windows.
++ *
++ * The 32-bit address mode (_ADDR_MODE_CNTL, hw_init_regs) keeps everything
++ * the GPU can see below 4 GB: the page tables, the ring, the SQE and the
++ * fence page all come out of the pool.
++ * ======================================================================= */
++
++#define VA_USER_START       0x01000000ull   /* BOs: [VA_USER_START, VA_KERNEL) */
++#define VA_KERNEL           0xf0000000ull   /* the ring, the SQE, the fence page */
++#define VA_GUARD            VA_BYTES        /* a page after every kernel buffer */
++
++#define PTE_VALID           (1ull << 0)
++#define PTE_TABLE           (1ull << 1)
++#define PTE_AP_UNPRIV       (1ull << 6)     /* the GPU fetches as unprivileged */
++#define PTE_AP_RO           (1ull << 7)
++#define PTE_SH_OUTER        (2ull << 8)
++#define PTE_AF              (1ull << 10)
++#define PTE_PAGE            (PTE_VALID | PTE_TABLE | PTE_AP_UNPRIV | PTE_SH_OUTER | PTE_AF)
++
++extern "C" uint32_t gpu_va, gpu_log;    /* boot-args (RedwoodGPU.cpp reads them) */
++
++static uint64_t *g_l1;
++static uint64_t g_l1_pa;
++static uint64_t *g_l2[4];
++static uint64_t g_l2_pa[4];
++struct l3_slot {
++	uint64_t *table;
++	uint64_t pa;
++	uint32_t index;                 /* va >> 21 */
++};
++static struct l3_slot g_l3s[64];
++static unsigned g_l3s_n;
++
++static uint64_t g_kernel_va;            /* kernel buffers: up from VA_KERNEL */
++struct va_range {
++	uint64_t start, size;
++};
++static struct va_range g_vafree[48];
++static unsigned g_vafree_n;
++
++static IOLock *g_hwlock;
++static bool g_hw_started, g_hw_failed, g_wedged;
++
++static uint64_t gk_ring_va, gk_sqe_va, gk_fence_va, gk_test_va;
++static uint32_t *gk_ring, *gk_fence, *gk_test;
++static uint8_t *gk_sqe;
++static uint32_t gk_wptr, gk_seqno;
++static uint64_t gk_pend_since;
++static uint32_t gk_pend_subs;
++static struct {
++	uint64_t microseconds;
++	uint32_t submissions, by[7];
++} gk_worked;
++
++#define CP_INDIRECT_BUFFER  0x3f
++#define CP_EVENT_WRITE      0x46
++#define CACHE_FLUSH_TS      4
++
++extern "C" void redwood_tl(const char * fmt, ...) __printflike(1, 2);
++
++void
++redwood_tl(const char * fmt, ...)
++{
++	char buf[256];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	IOLog("redwood: %s", buf);
++}
++
++/* ---- the page tables (the Windows driver's model, in the pool) -------- */
++
++static uint64_t *
++table_alloc(uint64_t * pa)
++{
++	uint64_t tpa = 0;
++	uint64_t *t = (uint64_t *)pool_alloc(VA_BYTES, &tpa);
++
++	if (t != NULL && pa != NULL) {
++		*pa = tpa;
++	}
++	return t;
++}
++
++static uint64_t *
++l3_for(uint64_t va, bool create)
++{
++	uint32_t i1 = (uint32_t)(va >> 30);
++
++	if (i1 >= 4) {
++		return NULL;
++	}
++	if (g_l2[i1] == NULL) {
++		if (!create || (g_l2[i1] = table_alloc(&g_l2_pa[i1])) == NULL) {
++			return NULL;
++		}
++		g_l1[i1] = g_l2_pa[i1] | PTE_VALID | PTE_TABLE;
++	}
++	for (unsigned i = 0; i < g_l3s_n; i++) {
++		if (g_l3s[i].index == (uint32_t)(va >> 21)) {
++			return g_l3s[i].table;
++		}
++	}
++	if (!create || g_l3s_n == sizeof(g_l3s) / sizeof(g_l3s[0])) {
++		return NULL;
++	}
++	struct l3_slot *s = &g_l3s[g_l3s_n];
++
++	s->table = table_alloc(&s->pa);
++	if (s->table == NULL) {
++		return NULL;
++	}
++	s->index = (uint32_t)(va >> 21);
++	return g_l3s[g_l3s_n++].table;
++}
++
++static bool
++mmu_map_page(uint64_t va, uint64_t pa, bool ro)
++{
++	uint64_t *l3 = l3_for(va, true);
++
++	if (l3 == NULL) {
++		return false;
++	}
++	l3[(va >> 12) & 511] = (pa & ~(VA_BYTES - 1)) | PTE_PAGE | (ro ? PTE_AP_RO : 0);
++	return true;
++}
++
++static void
++mmu_unmap_page(uint64_t va)
++{
++	uint64_t *l3 = l3_for(va, false);
++
++	if (l3 != NULL) {
++		l3[(va >> 12) & 511] = 0;
++	}
++}
++
++/* the user part of the GPU address space, first fit over a small list */
++
++static void
++va_space_init(void)
++{
++	g_vafree_n = 1;
++	g_vafree[0].start = VA_USER_START;
++	g_vafree[0].size = VA_KERNEL - VA_USER_START;
++	g_kernel_va = VA_KERNEL;
++}
++
++static uint64_t
++va_alloc(uint64_t size)
++{
++	size = (size + VA_BYTES - 1) & ~(VA_BYTES - 1);
++
++	for (unsigned i = 0; i < g_vafree_n; i++) {
++		if (g_vafree[i].size >= size) {
++			uint64_t va = g_vafree[i].start;
++
++			g_vafree[i].start += size;
++			g_vafree[i].size -= size;
++			if (g_vafree[i].size == 0) {
++				g_vafree[i] = g_vafree[g_vafree_n - 1];
++				g_vafree_n--;
++			}
++			return va;
++		}
++	}
++	return 0;
++}
++
++static void
++va_free(uint64_t va, uint64_t size)
++{
++	if (g_vafree_n == sizeof(g_vafree) / sizeof(g_vafree[0])) {
++		return;                         /* the list is full: the range is lost (no coalescing yet) */
++	}
++	g_vafree[g_vafree_n].start = va;
++	g_vafree[g_vafree_n].size = (size + VA_BYTES - 1) & ~(VA_BYTES - 1);
++	g_vafree_n++;
++}
++
++/* a kernel-owned buffer: pool pages below 4 GB at the next kernel address */
++static bool
++kbuf(uint64_t size, uint64_t * va_out, void ** cpu_out)
++{
++	uint64_t pa = 0, rounded = (size + VA_BYTES - 1) & ~(VA_BYTES - 1);
++	void *cpu = pool_alloc(size, &pa);
++	uint64_t va;
++
++	if (cpu == NULL) {
++		return false;
++	}
++	va = g_kernel_va;
++	for (uint64_t off = 0; off < rounded; off += VA_BYTES) {
++		if (!mmu_map_page(va + off, pa + off, false)) {
++			return false;
++		}
++	}
++	g_kernel_va += rounded + VA_GUARD;
++	*va_out = va;
++	*cpu_out = cpu;
++	return true;
++}
++
++/* ---- the SMMU context, now with translation on ------------------------ */
++
++static bool
++smmu_stage1(void)
++{
++	announce("the SMMU context 0: LPAE tables, translation on");
++	g_l1 = table_alloc(&g_l1_pa);
++	if (g_l1 == NULL) {
++		LOG("  no pool page for the L1 table");
++		return false;
++	}
++	wr(g_smmu, SMMU_CB(0, CB_SCTLR), 0);        /* off while programming */
++	wr(g_smmu, SMMU_CB(0, CB_FSR), 0xffffffff); /* clear */
++	wr(g_smmu, SMMU_CB(0, CB_TTBR0), (uint32_t)g_l1_pa);
++	wr(g_smmu, SMMU_CB(0, CB_TCR), 32 | (1u << 23));    /* T0SZ 32: the A610's 4 GB */
++	wr(g_smmu, SMMU_CB(0, CB_MAIR0), 0x44);     /* attr 0: Normal non-cacheable */
++	wr(g_smmu, SMMU_CBA2R(0), 1);               /* AArch64 descriptors */
++	wr(g_smmu, SMMU_CBAR(0), 0x0001f000);       /* S1 translate, S2 bypass, VMID 0x1f */
++	mb();
++	wr(g_smmu, SMMU_CB(0, CB_SCTLR), 0x67);     /* M CFIE CFRE AFE TRE */
++	smmu_tlb_flush();
++	LOG("  TTBR0 %#llx SCTLR %#x TCR %#x", g_l1_pa, rd(g_smmu, SMMU_CB(0, CB_SCTLR)),
++	    rd(g_smmu, SMMU_CB(0, CB_TCR)));
++	return true;
++}
++
++/* ---- the CP on GPU addresses, and the fence --------------------------- */
++
++static uint32_t
++gk_free(void)
++{
++	uint32_t rptr = gpu_rd(0x806);
++
++	return (rptr + RB_DWORDS - gk_wptr % RB_DWORDS - 1) % RB_DWORDS;
++}
++
++static void
++gk_emit(uint32_t v)
++{
++	gk_ring[gk_wptr++ % RB_DWORDS] = v;
++}
++
++static void
++gk_kick(void)
++{
++	mb();
++	gpu_wr(0x807, gk_wptr % RB_DWORDS);         /* CP_RB_WPTR */
++}
++
++static bool
++gk_idle(uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 100; i++) {
++		if (gpu_rd(0x806) == gk_wptr % RB_DWORDS) {
++			return true;
++		}
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	LOG("  ring stuck: rptr %u wptr %u RBBM_STATUS %#x CP_HW_FAULT %#x", gpu_rd(0x806), gk_wptr % RB_DWORDS,
++	    gpu_rd(GPU_RBBM_STATUS), gpu_rd(GPU_CP_HW_FAULT));
++	LOG("  SMMU gfsr %#x CB0 FSR %#x FAR %#010x%08x", rd(g_smmu, SMMU_GFSR), rd(g_smmu, SMMU_CB(0, CB_FSR)),
++	    rd(g_smmu, SMMU_CB(0, CB_FAR)), rd(g_smmu, SMMU_CB(0, CB_FAR + 4)));
++	return false;
++}
++
++static bool
++cp_start_va(void)
++{
++	uint32_t sqe_size = 0;
++	uint8_t *fw = (uint8_t *)fw_get(fw_names[2], &sqe_size);
++
++	if (fw == NULL || sqe_size <= 4 || sqe_size > 0x10000) {
++		LOG("  no SQE firmware (%s, %u bytes)", fw_names[2], sqe_size);
++		if (fw != NULL) {
++			IOFree(fw, sqe_size);
++		}
++		return false;
++	}
++	announce("SQE, the ring and the fence page from the pool, the CP on GPU addresses");
++	if (!kbuf(sqe_size - 4, &gk_sqe_va, (void **)&gk_sqe) ||
++	    !kbuf(RB_BYTES, &gk_ring_va, (void **)&gk_ring) ||
++	    !kbuf(VA_BYTES, &gk_fence_va, (void **)&gk_fence) ||
++	    !kbuf(VA_BYTES, &gk_test_va, (void **)&gk_test)) {
++		LOG("  pool: no room for the kept-on buffers");
++		IOFree(fw, sqe_size);
++		return false;
++	}
++	memcpy(gk_sqe, fw + 4, sqe_size - 4);       /* the SQE without its first dword */
++	IOFree(fw, sqe_size);
++	hw_init_regs();
++
++	gpu_wr64(0x830, gk_sqe_va);                 /* CP_SQE_INSTR_BASE */
++	gpu_wr64(0x800, gk_ring_va);                /* CP_RB_BASE */
++	gpu_wr(0x802, 12 | (2 << 8) | (1u << 27));  /* CP_RB_CNTL: 32 KB, NO_UPDATE */
++	gk_wptr = 0;
++	gpu_wr(0x807, 0);
++	mb();
++	gpu_wr(0x808, 1);                           /* CP_SQE_CNTL: start */
++
++	gk_emit(pkt7(CP_ME_INIT, 8));
++	gk_emit(0x2f);
++	gk_emit(3);
++	gk_emit(0x20000000);
++	gk_emit(0);
++	gk_emit(0);
++	gk_emit(0);
++	gk_emit(0);
++	gk_emit(0);
++	gk_kick();
++	if (!gk_idle(100)) {
++		return false;
++	}
++	gk_emit(pkt7(CP_SET_SECURE_MODE, 1));
++	gk_emit(0);
++	gk_kick();
++	return gk_idle(100);
++}
++
++/* bring the GPU up from any state: power, the zap shader, the tables, the CP */
++static bool
++hw_start(void)
++{
++	if (g_hw_started) {
++		return true;
++	}
++	if (g_hw_failed) {
++		return false;
++	}
++	if (pool == NULL) {
++		IOMemoryMap *m = map_phys(POOL_PA, POOL_SIZE, true);
++
++		if (m == NULL) {
++			LOG("pool mapping failed");
++			g_hw_failed = true;
++			return false;
++		}
++		pool = (uint8_t *)m->getVirtualAddress();
++	}
++	if (g_gcc == NULL) {
++		g_gcc = (volatile uint32_t *)ml_io_map(GCC_PA, GCC_SIZE);
++		g_gpucc = (volatile uint32_t *)ml_io_map(GPUCC_PA, GPUCC_SIZE);
++		g_gpu = (volatile uint32_t *)ml_io_map(GPU_PA, GPU_SIZE);
++		g_smmu = (volatile uint32_t *)ml_io_map(SMMU_PA, SMMU_SIZE);
++		if (g_gcc == NULL || g_gpucc == NULL || g_gpu == NULL || g_smmu == NULL) {
++			LOG("register mappings failed");
++			g_hw_failed = true;
++			return false;
++		}
++	}
++	/* a fresh layout: the tables and the buffers are all allocated again */
++	pool_used = 0;
++	g_l1 = NULL;
++	g_l2[0] = g_l2[1] = g_l2[2] = g_l2[3] = NULL;
++	g_l3s_n = 0;
++	va_space_init();
++	g_wedged = false;
++
++	step = 1;
++	newest_step = 0;                            /* no holds: this is not a boot-arg step run */
++	power_cycle_if_on();
++	if (!step_power()) {
++		g_hw_failed = true;
++		return false;
++	}
++	step = 3;
++	if (!step_zap()) {
++		g_hw_failed = true;
++		return false;
++	}
++	step = 2;
++	if (!smmu_stage1()) {
++		g_hw_failed = true;
++		return false;
++	}
++	step = 4;
++	if (!cp_start_va()) {
++		g_hw_failed = true;
++		return false;
++	}
++	g_hw_started = true;
++	LOG("the GPU is up on GPU addresses (stage-1 tables, ring %#llx, fence %#llx)", gk_ring_va, gk_fence_va);
++	return true;
++}
++
++/* ---- the redwood_gpu_* API (RedwoodGPU.cpp links against these) ------- */
++
++extern "C" {
++
++bool
++redwood_gpu_ready(void)
++{
++	return g_hw_started && !g_wedged;
++}
++
++bool
++redwood_gpu_parameter(uint32_t which, uint64_t * value)
++{
++	switch (which) {
++	case 1:                                     /* MSM_PARAM_GPU_ID */
++		*value = 610;
++		return true;
++	case 2:                                     /* MSM_PARAM_GMEM_SIZE */
++		*value = 0x21000;                       /* 128K + 4K, khaje */
++		return true;
++	case 3:                                     /* MSM_PARAM_CHIP_ID */
++		*value = 0x06010001;
++		return true;
++	case 4:                                     /* MSM_PARAM_MAX_FREQ */
++		*value = 300000000;                     /* GPLL0/2, where hw_start leaves the core */
++		return true;
++	case 5:                                     /* MSM_PARAM_TIMESTAMP */
++		*value = g_hw_started ? ((uint64_t)gpu_rd(GPU_CP_ALWAYS_ON + 1) << 32) | gpu_rd(GPU_CP_ALWAYS_ON) : 0;
++		return true;
++	case 6:                                     /* MSM_PARAM_GMEM_BASE */
++		*value = 0x100000;
++		return true;
++	case 7:                                     /* MSM_PARAM_PRIORITIES */
++		*value = 1;
++		return true;
++	case 8:                                     /* MSM_PARAM_PP_PGTABLE */
++	case 9:                                     /* MSM_PARAM_FAULTS */
++	case 10:                                    /* MSM_PARAM_SUSPENDS */
++		*value = 0;
++		return true;
++	case 14:                                    /* MSM_PARAM_VA_START */
++		*value = VA_USER_START;
++		return true;
++	case 15:                                    /* MSM_PARAM_VA_SIZE */
++		*value = VA_KERNEL - VA_USER_START;
++		return true;
++	default:
++		return false;
++	}
++}
++
++uint64_t
++redwood_gpu_address(uint64_t size)
++{
++	return va_alloc(size);
++}
++
++void
++redwood_gpu_address_free(uint64_t address, uint64_t size)
++{
++	va_free(address, size);
++}
++
++void
++redwood_gpu_space(uint64_t * used, uint32_t * live, uint64_t * largest, unsigned * holes, unsigned * most,
++    uint64_t * lost, uint32_t * refused)
++{
++	uint64_t free_bytes = 0, biggest = 0;
++
++	for (unsigned i = 0; i < g_vafree_n; i++) {
++		free_bytes += g_vafree[i].size;
++		if (g_vafree[i].size > biggest) {
++			biggest = g_vafree[i].size;
++		}
++	}
++	if (used != NULL) {
++		*used = (VA_KERNEL - VA_USER_START) - free_bytes;
++	}
++	if (live != NULL) {
++		*live = 0;                              /* the service counts its own buffers */
++	}
++	if (largest != NULL) {
++		*largest = biggest;
++	}
++	if (holes != NULL) {
++		*holes = g_vafree_n;
++	}
++	if (most != NULL) {
++		*most = sizeof(g_vafree) / sizeof(g_vafree[0]);
++	}
++	if (lost != NULL) {
++		*lost = 0;
++	}
++	if (refused != NULL) {
++		*refused = 0;
++	}
++}
++
++bool
++redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
++{
++	return mmu_map_page(address, phys, read_only);
++}
++
++void
++redwood_gpu_mapped(void)
++{
++	smmu_tlb_flush();
++}
++
++void
++redwood_gpu_unmap(uint64_t address, uint64_t size)
++{
++	for (uint64_t off = 0; off < size; off += VA_BYTES) {
++		mmu_unmap_page(address + off);
++	}
++	smmu_tlb_flush();
++}
++
++void
++redwood_gpu_to_memory(void * start, uint64_t size)
++{
++	clean_dcache64((addr64_t)(uintptr_t)start, (unsigned)size, FALSE);
++	mb();
++}
++
++uint32_t
++redwood_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count)
++{
++	uint32_t need = 4 * count + 5, spin;
++
++	if (!g_hw_started && !g_hw_failed) {
++		if (!hw_start()) {
++			return 0;
++		}
++	}
++	if (!g_hw_started || g_wedged) {
++		return 0;
++	}
++	IOLockLock(g_hwlock);
++	for (spin = 0; gk_free() < need && spin < 100000; spin++) {
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	if (gk_free() < need) {
++		IOLockUnlock(g_hwlock);
++		LOG("submit: ring full");
++		return 0;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		gk_emit(pkt7(CP_INDIRECT_BUFFER, 3));
++		gk_emit((uint32_t)addresses[i]);
++		gk_emit((uint32_t)(addresses[i] >> 32));
++		gk_emit(words[i]);
++	}
++	gk_seqno++;
++	gk_emit(pkt7(CP_EVENT_WRITE, 4));
++	gk_emit(CACHE_FLUSH_TS);
++	gk_emit((uint32_t)gk_fence_va);
++	gk_emit((uint32_t)(gk_fence_va >> 32));
++	gk_emit(gk_seqno);
++	gk_kick();
++	gk_pend_since = ((uint64_t)gpu_rd(GPU_CP_ALWAYS_ON + 1) << 32) | gpu_rd(GPU_CP_ALWAYS_ON);
++	gk_pend_subs++;
++	IOLockUnlock(g_hwlock);
++	return gk_seqno;
++}
++
++bool
++redwood_gpu_done(uint32_t fence)
++{
++	if (gk_fence == NULL || g_wedged) {
++		return true;
++	}
++	if ((int32_t)(gk_fence[0] - fence) >= 0) {
++		if (gk_pend_subs != 0) {
++			uint64_t now = ((uint64_t)gpu_rd(GPU_CP_ALWAYS_ON + 1) << 32) | gpu_rd(GPU_CP_ALWAYS_ON);
++			uint64_t ticks = now - gk_pend_since, us = ticks / 19;
++			unsigned b = 0;
++
++			while (b < 6 && us >= (100ull << b)) {
++				b++;
++			}
++			gk_worked.by[b]++;
++			gk_worked.microseconds += us;
++			gk_worked.submissions++;
++			gk_pend_subs = 0;
++		}
++		return true;
++	}
++	return false;
++}
++
++uint32_t
++redwood_gpu_last(void)
++{
++	return gk_fence != NULL ? gk_fence[0] : 0;
++}
++
++void
++redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7])
++{
++	if (microseconds != NULL) {
++		*microseconds = gk_worked.microseconds;
++	}
++	if (submissions != NULL) {
++		*submissions = gk_worked.submissions;
++	}
++	if (by != NULL) {
++		memcpy(by, gk_worked.by, sizeof(gk_worked.by));
++	}
++}
++
++void
++redwood_gpu_report(const char * why)
++{
++	LOG("report (%s): rptr %u wptr %u RBBM_STATUS %#x CP_HW_FAULT %#x", why ? why : "", gpu_rd(0x806),
++	    gk_wptr % RB_DWORDS, gpu_rd(GPU_RBBM_STATUS), gpu_rd(GPU_CP_HW_FAULT));
++	LOG("  IB1 %#010x%08x rem %u, IB2 %#010x%08x rem %u", gpu_rd(0x929), gpu_rd(0x928), gpu_rd(0x92a),
++	    gpu_rd(0x92c), gpu_rd(0x92b), gpu_rd(0x92d));
++	LOG("  SMMU gfsr %#x CB0 FSR %#x FAR %#010x%08x", rd(g_smmu, SMMU_GFSR), rd(g_smmu, SMMU_CB(0, CB_FSR)),
++	    rd(g_smmu, SMMU_CB(0, CB_FAR)), rd(g_smmu, SMMU_CB(0, CB_FAR + 4)));
++}
++
++bool
++redwood_gpu_recover(void)
++{
++	bool ok;
++
++	IOLockLock(g_hwlock);
++	LOG("recover: the GPU is reset and started again");
++	g_hw_started = false;
++	g_hw_failed = false;
++	g_wedged = false;
++	ok = hw_start();
++	IOLockUnlock(g_hwlock);
++	return ok;
++}
++
++void
++redwood_gpu_stop(void)
++{
++	if (g_gpu != NULL) {
++		gpu_wr(0x808, 0);                       /* CP_SQE_CNTL: stop */
++	}
++	g_hw_started = false;
++}
++
++}  /* extern "C" */
++
++/* ---------------------------------------------------------------- step 6: everything together */
++
++static bool
++step_vaspace(void)
++{
++	uint64_t ib_va = 0;
++	uint32_t *ib_cpu = NULL;
++	uint32_t fence, i;
++
++	announce("stage-1 tables, the CP on GPU addresses, one IB and a fence");
++	if (!hw_start()) {
++		return false;
++	}
++	if (!kbuf(0x100, &ib_va, (void **)&ib_cpu)) {
++		LOG("  pool: no room for the IB");
++		return false;
++	}
++	ib_cpu[0] = pkt7(CP_MEM_WRITE, 3);
++	ib_cpu[1] = (uint32_t)gk_test_va;
++	ib_cpu[2] = (uint32_t)(gk_test_va >> 32);
++	ib_cpu[3] = 0xc0ffee01;
++	redwood_gpu_to_memory(ib_cpu, 16);
++
++	const uint32_t ib_words = 4;
++
++	fence = redwood_gpu_submit(&ib_va, &ib_words, 1);
++	if (fence == 0) {
++		LOG("  submit failed");
++		return false;
++	}
++	for (i = 0; i < 5000; i++) {
++		if (redwood_gpu_done(fence)) {
++			break;
++		}
++		delay_for_interval(1000, NSEC_PER_USEC);
++	}
++	if (!redwood_gpu_done(fence)) {
++		redwood_gpu_report("the fence did not rise");
++		return false;
++	}
++	LOG("  fence %u up after %u ms, test buffer %08x %s", fence, i, gk_test[0],
++	    gk_test[0] == 0xc0ffee01 ? "= the IB ran on GPU addresses" : "(wrong value)");
++	return gk_test[0] == 0xc0ffee01;
++}
++
+ /* ---------------------------------------------------------------- the steps */
+ 
+ static bool
+ (*const steps[])(void) = {
+-	step_power, step_smmu, step_zap, step_cp, step_memwrite,
++	step_power, step_smmu, step_zap, step_cp, step_memwrite, step_vaspace,
+ };
+ 
+ #define NSTEPS (sizeof(steps) / sizeof(steps[0]))
+@@ -1003,6 +1695,8 @@ topaz_adreno_init(void)
+ 		return;
+ 	}
+ 	started = true;
++	PE_parse_boot_argn("gpu_va", &gpu_va, sizeof(gpu_va));
++	PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
+ 	if (kernel_thread_start(topaz_adreno_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
