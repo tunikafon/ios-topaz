@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
-index 07189da..a744dfc 100644
+index 07189da..64395b5 100644
 --- a/iokit/Kernel/arm/TopazAdreno.cpp
 +++ b/iokit/Kernel/arm/TopazAdreno.cpp
 @@ -48,6 +48,7 @@
@@ -10,7 +10,7 @@ index 07189da..a744dfc 100644
  #include <sys/vnode.h>
  #include <sys/fcntl.h>
  #include <sys/proc.h>
-@@ -922,11 +923,702 @@ step_memwrite(void)
+@@ -922,11 +923,703 @@ step_memwrite(void)
  	return g_mem[0] == 0xc0ffee00;
  }
  
@@ -28,6 +28,7 @@ index 07189da..a744dfc 100644
 + * fence page all come out of the pool.
 + * ======================================================================= */
 +
++#define VA_BYTES            0x1000ull       /* everything is page-granular; the A610's input is 4 GB */
 +#define VA_USER_START       0x01000000ull   /* BOs: [VA_USER_START, VA_KERNEL) */
 +#define VA_KERNEL           0xf0000000ull   /* the ring, the SQE, the fence page */
 +#define VA_GUARD            VA_BYTES        /* a page after every kernel buffer */
@@ -714,7 +715,7 @@ index 07189da..a744dfc 100644
  };
  
  #define NSTEPS (sizeof(steps) / sizeof(steps[0]))
-@@ -1003,6 +1695,8 @@ topaz_adreno_init(void)
+@@ -1003,6 +1696,8 @@ topaz_adreno_init(void)
  		return;
  	}
  	started = true;
